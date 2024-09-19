@@ -1,0 +1,140 @@
+# Deploy to Azure Kubernetes Service
+# Build and push image to Azure Container Registry; Deploy to Azure Kubernetes Service
+# https://docs.microsoft.com/azure/devops/pipelines/languages/docker
+
+trigger:
+- none
+
+resources:
+- repo: self
+
+variables:
+
+  # Container registry service connection established during pipeline creation
+  dockerRegistryServiceConnection: '916f3fb0-a701-494e-8f2c-73e1808a9f30'
+  imageRepository: 'nginxscanned'
+  containerRegistry: 'fluxv2.azurecr.io'
+  tag: '$(Build.BuildId)'
+  storageaccount: 'poctrivyscan'
+  sacontainername: 'trivy-scan-reports'
+  dockerfilePath: '**/Dockerfile'
+  serviceconn: 'cicd-service-connection'
+  imagePullSecret: 'fluxv2201619d6-auth'
+  target: $(build.artifactstagingdirectory)
+  artifact: AM
+  resourcegroup: 'flux-demo'
+  # Agent VM image name
+  vmImageName: 'ubuntu-latest'
+
+stages:
+- stage: Build
+  displayName: Build stage
+  jobs:
+  - job: Build
+    displayName: Build
+    pool:
+      vmImage: $(vmImageName)
+    steps:
+    - task: Docker@2
+      displayName: Build and push an image to container registry
+      inputs:
+        command: buildAndPush
+        repository: $(imageRepository)
+        dockerfile: $(dockerfilePath)
+        containerRegistry: $(dockerRegistryServiceConnection)
+        tags: |
+          $(tag)
+    - upload: manifests
+      artifact: manifests
+    
+#######################################
+# Download and Install Aquasec Trivy:-#
+#######################################
+    - task: CmdLine@2
+      displayName: DOWNLOAD AND INSTALL AQUASEC TRIVY
+      inputs:
+        script: |
+         sudo apt-get install wget apt-transport-https gnupg lsb-release
+         wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+         echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+         sudo apt-get update
+         sudo apt-get install trivy
+         trivy -v
+         pwd
+
+##################################################################################
+# Execute Trivy Scan and Copy the Scan Results in Artifacts Staging Directory:-  #
+##################################################################################
+# Is possible to ignore some CVEs adding in the repository file ".trivyignore"
+# Command example: trivy image --ignorefile .trivyignore
+# Is possible as well ignore only unfixed vulnerabilities with --ignore-unfixed
+    - task: CmdLine@2
+      displayName: RUN AQUASEC TRIVY SCAN AND COPY TO ARTIFACTS STAGING DIRECTORY
+      inputs:
+        script: |
+          trivy image --exit-code 0 --severity LOW,MEDIUM $(containerRegistry)/$(imageRepository):$(tag) > low-med.txt
+          trivy image --exit-code 1 --severity HIGH,CRITICAL $(containerRegistry)/$(imageRepository):$(tag) > high-critical.txt
+          ls -l
+          cp -rvf *.txt $(target)
+##########################
+# Publish the Artifacts:-#
+##########################
+    - task: PublishBuildArtifacts@1
+      displayName: PUBLISH ARTIFACTS
+      inputs:
+        targetPath: '$(target)'
+        artifactName: '$(artifact)'
+
+######################################
+# Download the Published Artifacts:- #
+######################################
+    - task: DownloadBuildArtifacts@1
+      displayName: DOWNLOAD ARTIFACTS
+      inputs:
+        buildType: 'current'
+        downloadType: 'single'
+        downloadPath: '$(System.ArtifactsDirectory)'
+###################################################################################
+# Copy Reports to Blob Storage in the folder Trivy-scan with timestamp            #
+###################################################################################
+    - task: AzureCLI@2
+      displayName: COPY AQUASEC TRIVY SCAN REPORTS TO BLOB STORAGE
+      inputs:
+        azureSubscription: '$(serviceconn)'
+        scriptType: 'pscore'
+        scriptLocation: 'inlineScript'
+        inlineScript: 'az storage blob upload-batch --destination $(sacontainerName)/Trivy-scan/$(date "+%d-%m-%Y_%H-%M-%S") --account-name $(storageaccount) --source $(System.ArtifactsDirectory) --pattern "*.txt"'
+######################################
+# DEPLOY TO AKS:-                    #
+######################################
+- stage: Deploy
+  displayName: Deploy stage
+  jobs:
+  - deployment: Deploy
+    displayName: Deploy
+    pool:
+      vmImage: $(vmImageName)
+    environment: 'juwisnieScanImagesInACRUsingTrivy-2133.nginx'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: KubernetesManifest@0
+            displayName: Create imagePullSecret
+            inputs:
+              action: createSecret
+              secretName: $(imagePullSecret)
+              dockerRegistryEndpoint: $(dockerRegistryServiceConnection)
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              manifests: |
+                $(Pipeline.Workspace)/manifests/deployment.yml
+                $(Pipeline.Workspace)/manifests/service.yml
+              imagePullSecrets: |
+                $(imagePullSecret)
+              containers: |
+                $(containerRegistry)/$(imageRepository):$(tag)
+
